@@ -6,7 +6,7 @@ import "./VaultManager.sol";
 
 contract VaultBalancer is VaultManager {
     using SafeMath for uint256;
-    
+
     function rebalanceVault(
         address _vaultAddress, 
         uint256 _vaultID,
@@ -16,12 +16,11 @@ contract VaultBalancer is VaultManager {
         address[] memory _path
     ) 
         external
-        onlyOwner
     {
         IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
 
         if (vault.vaultDebt(_vaultID) == 0) {
-            borrowMaiFromVault(_vaultAddress, _vaultID, vault.vaultCollateral(_vaultID), _desiredCollateralPercentage);
+            borrowMaiAndSendToOwner(_vaultAddress, _vaultID, vault.vaultCollateral(_vaultID), _desiredCollateralPercentage);
         } else {
             uint256 collateralPercentage;
 
@@ -39,9 +38,11 @@ contract VaultBalancer is VaultManager {
                 buyAndDepositCollateralIntoVault(_vaultAddress, _vaultID, _vaultType, shortfallCollateral, _routerAddress, _path);
             } else if (desiredCollateral < vault.vaultCollateral(_vaultID) ) {
                 uint256 surplusCollateral = vault.vaultCollateral(_vaultID) - desiredCollateral;
-                borrowMaiFromVault(_vaultAddress, _vaultID, surplusCollateral, _desiredCollateralPercentage);
+                borrowMaiAndSendToOwner(_vaultAddress, _vaultID, surplusCollateral, _desiredCollateralPercentage);
+
             }
         }
+        returnVaultToSender(_vaultAddress, _vaultID, msg.sender);
     }
 
     function buyAndDepositCollateralIntoVault(
@@ -52,23 +53,22 @@ contract VaultBalancer is VaultManager {
         address _routerAddress,
         address[] memory _path
     ) 
-        public
-        onlyOwner 
+        internal 
     {   
-        uint256 availableMAI;
-
+        
         //get the swap router
         IUniswapV2Router02 swapRouter = IUniswapV2Router02(_routerAddress);
         
         if (MAI_MATIC == _vaultAddress && block.chainid == 137) {
-            // all MAI vailable
-            availableMAI = IERC20(MAI_MATIC).balanceOf(address(this));
-            // approve the swaprouter for trade
-            IERC20(MAI_MATIC).approve(address(swapRouter), availableMAI);
+            
             // make the swap
             uint256[] memory amountsIn = swapRouter.getAmountsIn(_shortfallCollateral, _path);
-            uint256 amountInMax = amountsIn[0].mul(101).div(100); // with 3% slippage
+            uint256 amountInMax = amountsIn[0].mul(101).div(100); // with 1% slippage
                 
+            IERC20(MAI_MATIC).transferFrom(address(msg.sender), address(this), amountInMax);
+            
+            IERC20(MAI_MATIC).approve(address(swapRouter), amountInMax);
+            
             swapRouter.swapExactTokensForETH(
                 amountInMax,
                 _shortfallCollateral,
@@ -82,37 +82,33 @@ contract VaultBalancer is VaultManager {
             else 
         {
             IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
-            // get the MAI available
-            availableMAI = IERC20(vault.mai()).balanceOf(address(this));
-                
+            
+            this.receiveERC20Vault(_vaultAddress, _vaultID);
+            
+            SwapForCollateralDetails memory details = SwapForCollateralDetails (
+                vault,
+                _shortfallCollateral,
+                swapRouter,
+                _path
+            );
+
             if (_vaultType == VaultType.CamToken ) {
-                swapTokensForCamTokens(
-                    vault.collateral(),
-                    _shortfallCollateral,
-                    vault.mai(),
-                    availableMAI,
-                    _routerAddress,
-                    _path
-                );
+                swapTokensForCamTokens(details);
             }
 
             else if (_vaultType == VaultType.MooSingleToken) {
-                swapTokensForMooSingleTokens(
-                    vault.collateral(),
-                    _shortfallCollateral,
-                    vault.mai(),
-                    availableMAI,
-                    _routerAddress,
-                    _path
-                );
+                swapTokensForMooSingleTokens(details);
             }
 
             else if (_vaultType == VaultType.SingleToken){
-                // approve the swaprouter for trade
-                IERC20(vault.mai()).approve(address(swapRouter), availableMAI);
+                
                 // get amount to put in
                 uint256[] memory amountsIn = swapRouter.getAmountsIn(_shortfallCollateral, _path);
                 uint256 amountInMax = amountsIn[0].mul(101).div(100); // with 3% slippage
+                IERC20(vault.mai()).transferFrom(address(msg.sender), address(this), amountInMax);
+            
+                IERC20(vault.mai()).approve(address(swapRouter), amountInMax);
+            
                 // make the swap
                 swapRouter.swapExactTokensForTokens(
                     amountInMax,
@@ -128,14 +124,13 @@ contract VaultBalancer is VaultManager {
         }
     }
 
-    function borrowMaiFromVault(
+    function borrowMaiAndSendToOwner(
         address _vaultAddress, 
         uint256 _vaultID, 
         uint256 _surplusCollateralAmount,
         uint256 _desiredCollateralPercentage
     ) 
-        public
-        onlyOwner 
+        internal
     {
         // the borrow should be a percent of the collateral value
         IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
@@ -144,5 +139,6 @@ contract VaultBalancer is VaultManager {
         uint256 borrowValue = surplusCollateralValue.mul(100).div(_desiredCollateralPercentage);
 
         vault.borrowToken(_vaultID, borrowValue);
+        IERC20(vault.mai()).transfer(msg.sender, borrowValue);
     }
 }

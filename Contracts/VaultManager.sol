@@ -25,15 +25,32 @@ contract VaultManager is Withdrawable, IERC721Receiver {
     address constant MAI_MATIC = 0xa3Fa99A148fA48D14Ed51d610c367C61876997F1;
     enum VaultType { SingleToken, CamToken, MooSingleToken, MooLPToken }
 
+    struct SwapForCollateralDetails {
+        IERC20Stablecoin Vault;
+        uint256 ShortfallCollateral;
+        IUniswapV2Router02 SwapRouter;
+        address[] Path;
+    }
+    
     function receiveERC20Vault(
         address _vaultAddress, 
         uint256 _vaultID
     ) 
-        external 
-        onlyOwner
+        external
     {
         IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
         vault.safeTransferFrom(msg.sender, address(this), _vaultID);
+    }
+
+    function requestERC20Vault(
+        address _vaultAddress, 
+        uint256 _vaultID,
+        address _owner
+    ) 
+        internal
+    {
+        IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
+        vault.safeTransferFrom(_owner, address(this), _vaultID);
     }
 
     function returnVault(
@@ -51,6 +68,18 @@ contract VaultManager is Withdrawable, IERC721Receiver {
             IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
             vault.safeTransferFrom(address(this), msg.sender, _vaultID);
         }
+    }
+
+    function returnVaultToSender(
+        address _vaultAddress, 
+        uint256 _vaultID,
+        address _sender
+    ) 
+        internal
+    {
+        require(_vaultAddress != MAI_MATIC, "CANNOT RETURN NATIVE MATIC VAULTS");
+        IERC20Stablecoin vault = IERC20Stablecoin(_vaultAddress);
+        vault.safeTransferFrom(address(this), _sender, _vaultID);
     }
 
     function onERC721Received(
@@ -118,35 +147,25 @@ contract VaultManager is Withdrawable, IERC721Receiver {
     }
 
 
-    function swapTokensForCamTokens (
-        address _camTokenAddress,
-        uint256 _minAcceptedTokens,
-        address _fromToken,
-        uint256 _maxOffered,
-        address _routerAddress,
-        address[] memory _path
-    ) 
-        public
-        onlyOwner
+    function swapTokensForCamTokens (SwapForCollateralDetails memory details) 
+        internal
     {
         // get the starting amount of amTokens
-        address amTokenAddress = ICamToken(_camTokenAddress).Token();
-        uint256 amTokenAmount = _minAcceptedTokens.mul(IERC20(amTokenAddress).balanceOf(_camTokenAddress)).div(IERC20(_camTokenAddress).totalSupply());// amToken amount == base Token amount
-
-        // get the swap router
-        IUniswapV2Router02 swapRouter = IUniswapV2Router02(_routerAddress);
+        address amTokenAddress = ICamToken(details.Vault.collateral()).Token();
+        uint256 amTokenAmount = details.ShortfallCollateral.mul(IERC20(amTokenAddress).balanceOf(details.Vault.collateral())).div(IERC20(details.Vault.collateral()).totalSupply());// amToken amount == base Token amount
         
-        uint256[] memory amountsIn = swapRouter.getAmountsIn(amTokenAmount, _path);
+        uint256[] memory amountsIn = details.SwapRouter.getAmountsIn(amTokenAmount, details.Path);
         uint256 amountInMax = amountsIn[0].mul(101).div(100); // with max 1% slippage
 
-        require (amountInMax <= _maxOffered, "TOO LITTLE OFFERED");
-        IERC20(_fromToken).approve(address(swapRouter), amountInMax);
+        // approvals must be done before transacting
+        IERC20(details.Vault.mai()).transferFrom(msg.sender, address(this), amountInMax);
+        IERC20(details.Vault.mai()).approve(address(details.SwapRouter), amountInMax);
 
         // make the swap
-        uint256[] memory amountsOut = swapRouter.swapExactTokensForTokens(
+        uint256[] memory amountsOut = details.SwapRouter.swapExactTokensForTokens(
             amountInMax, 
             amTokenAmount, // equal to the token amount
-            _path,
+            details.Path,
             address(this),
             block.timestamp
         );
@@ -154,8 +173,8 @@ contract VaultManager is Withdrawable, IERC721Receiver {
         // deposit tokens for amtokens
         address underlyingAssetAddress = IAmToken(amTokenAddress).UNDERLYING_ASSET_ADDRESS();
 
-        IERC20(underlyingAssetAddress).approve(ICamToken(_camTokenAddress).LENDING_POOL(), amountsOut[amountsOut.length - 1]); // all tokens received
-        ILendingPool(ICamToken(_camTokenAddress).LENDING_POOL()).deposit(
+        IERC20(underlyingAssetAddress).approve(ICamToken(details.Vault.collateral()).LENDING_POOL(), amountsOut[amountsOut.length - 1]); // all tokens received
+        ILendingPool(ICamToken(details.Vault.collateral()).LENDING_POOL()).deposit(
             underlyingAssetAddress,
             amountsOut[amountsOut.length - 1],
             address(this),
@@ -164,8 +183,8 @@ contract VaultManager is Withdrawable, IERC721Receiver {
 
         // deposit amTokens for camTokens
 
-        IERC20(amTokenAddress).approve(_camTokenAddress, amountsOut[amountsOut.length - 1]); // tokens received equal to amtokens swapped
-        ICamToken(_camTokenAddress).enter(amountsOut[amountsOut.length - 1]);
+        IERC20(amTokenAddress).approve(details.Vault.collateral(), amountsOut[amountsOut.length - 1]); // tokens received equal to amtokens swapped
+        ICamToken(details.Vault.collateral()).enter(amountsOut[amountsOut.length - 1]);
         // there are now CamTokens in the address
     }
 
@@ -217,42 +236,35 @@ contract VaultManager is Withdrawable, IERC721Receiver {
         return camTokensToLiquidate;
     }
     
-    function swapTokensForMooSingleTokens (
-        address _mooTokenAddress,
-        uint256 _minAcceptedTokens,
-        address _fromToken,
-        uint256 _maxOffered,
-        address _routerAddress,
-        address[] memory _path
-    ) 
+    function swapTokensForMooSingleTokens (SwapForCollateralDetails memory details) 
         public
         onlyOwner
     {
         // get the starting amount of the single tokens
-        address tokenAddress = IMooToken(_mooTokenAddress).want();
-        address stratAddress = IMooToken(_mooTokenAddress).strategy();
+        address tokenAddress = IMooToken(details.Vault.collateral()).want();
+        address stratAddress = IMooToken(details.Vault.collateral()).strategy();
         // total value in token locked in moo contract
-        uint256 totalTokenLocked = (IERC20(tokenAddress).balanceOf(_mooTokenAddress)).add(IStrategy(stratAddress).balanceOf());
-        uint256 tokenAmount = _minAcceptedTokens.mul(totalTokenLocked).div(IERC20(_mooTokenAddress).totalSupply()); // amount of tokens I need to make the moo tokens minimum 
+        uint256 totalTokenLocked = (IERC20(tokenAddress).balanceOf(details.Vault.collateral())).add(IStrategy(stratAddress).balanceOf());
+        uint256 tokenAmount = details.ShortfallCollateral.mul(totalTokenLocked).div(IERC20(details.Vault.collateral()).totalSupply()); // amount of tokens I need to make the moo tokens minimum 
         
-        uint256[] memory amountsIn = IUniswapV2Router02(_routerAddress).getAmountsIn(tokenAmount, _path);
+        uint256[] memory amountsIn = details.SwapRouter.getAmountsIn(tokenAmount, details.Path);
         uint256 amountInMax = amountsIn[0].mul(101).div(100); // with max 3% slippage
 
-        require (amountInMax <= _maxOffered, "TOO LITTLE OFFERED");
-        IERC20(_fromToken).approve(_routerAddress, amountInMax);
+        IERC20(details.Vault.mai()).transferFrom(msg.sender, address(this), amountInMax);
+        IERC20(details.Vault.mai()).approve(address(details.SwapRouter), amountInMax);
 
         // make the swap
-        uint256[] memory amountsOut = IUniswapV2Router02(_routerAddress).swapExactTokensForTokens(
+        uint256[] memory amountsOut = details.SwapRouter.swapExactTokensForTokens(
             amountInMax,
             tokenAmount, // equal to the token amount
-            _path,
+            details.Path,
             address(this),
             block.timestamp
         );
 
         // deposit tokens for moo tokens
-        IERC20(tokenAddress).approve(_mooTokenAddress, amountsOut[amountsOut.length - 1]);
-        IMooToken(_mooTokenAddress).deposit(amountsOut[amountsOut.length - 1]);
+        IERC20(tokenAddress).approve(details.Vault.collateral(), amountsOut[amountsOut.length - 1]);
+        IMooToken(details.Vault.collateral()).deposit(amountsOut[amountsOut.length - 1]);
 
         // the address now has mootokens
 
